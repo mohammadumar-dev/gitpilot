@@ -113,7 +113,9 @@ func executeCommand(args []string) {
 	case "commit":
 		executeCommit(args[1:])
 	case "push":
-		executePush()
+		if err := executePush(); err != nil {
+			fmt.Println("❌ Push failed:", err)
+		}
 	case "pull":
 		executePull()
 	case "config":
@@ -345,6 +347,9 @@ func executeCommit(args []string) {
 	}
 
 	printCommitSummary(summary)
+	if len(summary.Committed) > 0 {
+		promptPushAfterCommits()
+	}
 }
 
 func promptCommitMode() string {
@@ -434,6 +439,20 @@ func printCommitPreview(plan CommitPlan, message string) {
 func approveCommit(plan CommitPlan, message string) bool {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Printf("Approve commit for %s? [y/N]: ", plan.Label)
+
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		fmt.Println("❌ Failed to read approval:", err)
+		return false
+	}
+
+	answer = strings.TrimSpace(strings.ToLower(answer))
+	return answer == "y" || answer == "yes"
+}
+
+func promptYesNo(prompt string) bool {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print(prompt)
 
 	answer, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -655,6 +674,18 @@ func printCommitSummary(summary commitRunSummary) {
 	}
 }
 
+func promptPushAfterCommits() {
+	fmt.Println("\nCommit session finished.")
+	if !promptYesNo("Push committed changes now? [y/N]: ") {
+		fmt.Println("Push skipped.")
+		return
+	}
+
+	if err := executePush(); err != nil {
+		fmt.Println("❌ Push failed:", err)
+	}
+}
+
 func formatFileList(changes []FileChange) string {
 	names := make([]string, 0, len(changes))
 	for _, change := range changes {
@@ -825,8 +856,30 @@ func printConfig() {
 	fmt.Println("Groq model:", getGroqModel())
 }
 
-func executePush() {
+func executePush() error {
+	fmt.Println("Push preview:")
+
+	statusOutput, statusErr := runGitCommand("status", "--short", "--branch")
+	if statusErr == nil && strings.TrimSpace(statusOutput) != "" {
+		fmt.Println(statusOutput)
+	}
+
+	if !promptYesNo("Approve push? [y/N]: ") {
+		fmt.Println("Push cancelled.")
+		return nil
+	}
+
 	fmt.Println("Pushing to remote...")
+	output, err := runGitCommand("push")
+	if strings.TrimSpace(output) != "" {
+		fmt.Println(output)
+	}
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Push completed.")
+	return nil
 }
 
 func executePull() {
