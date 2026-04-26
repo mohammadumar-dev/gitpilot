@@ -670,7 +670,7 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 		Messages: []chatMessage{
 			{
 				Role:    "system",
-				Content: "You write concise git commit messages. Reply with exactly one imperative commit subject line, no quotes, no bullet points, max 72 characters.",
+				Content: "You write concise git commit messages. Reply with exactly one imperative commit subject line using a conventional prefix such as feat:, fix:, refactor:, docs:, test:, chore:, style:, perf:, build:, or ci:. Choose the most accurate tag from the diff. No quotes, no bullet points, max 72 characters.",
 			},
 			{
 				Role:    "user",
