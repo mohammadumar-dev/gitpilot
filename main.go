@@ -63,6 +63,11 @@ type CommitPlan struct {
 	Changes []FileChange
 }
 
+type CommitInfo struct {
+	Hash    string
+	Subject string
+}
+
 type commitGroupProposal struct {
 	Label string   `json:"label"`
 	Files []string `json:"files"`
@@ -80,7 +85,7 @@ func printWelcome() {
 		colorStrong + "Git Pilot" + colorReset,
 		colorDim + "AI-assisted Git workflow for structured commits and push approvals" + colorReset,
 		"",
-		colorDim + "Commands: init, status, diff, commit, push, pull, config, help, exit" + colorReset,
+		colorDim + "Commands: init, status, diff, commit, push, pull, pr, config, help, exit" + colorReset,
 	})
 }
 
@@ -223,6 +228,8 @@ func executeCommand(args []string) {
 		executePull()
 	case "config":
 		executeConfig(args[1:])
+	case "pr":
+		executePR(args[1:])
 	case "help":
 		printHelp()
 	default:
@@ -1133,6 +1140,168 @@ func executePull() {
 	printSuccess("Pull completed.")
 }
 
+func executePR(args []string) {
+	printSection("PR Message")
+
+	apiKey, err := getGroqAPIKey()
+	if err != nil {
+		printError(err.Error())
+		fmt.Println("Set GROQ_API_KEY or run: config groq-key <your-key>")
+		return
+	}
+
+	base := "origin/main"
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		base = strings.TrimSpace(args[0])
+	}
+
+	commits, err := getCommitsAhead(base)
+	if err != nil {
+		printError(err.Error())
+		return
+	}
+	if len(commits) == 0 {
+		printWarning("No commits found ahead of " + base)
+		return
+	}
+
+	printPanel([]string{
+		colorStrong + "PR source" + colorReset,
+		colorDim + "Base" + colorReset + "    " + base,
+		colorDim + "Commits" + colorReset + " " + strconv.Itoa(len(commits)),
+		"",
+		formatCommitList(commits),
+	})
+
+	printInfo("Generating Markdown PR message from commit history...")
+	content, err := generatePRMessage(apiKey, getGroqModel(), base, commits)
+	if err != nil {
+		printError("PR generation failed: " + err.Error())
+		return
+	}
+
+	printSection("Copy Paste Markdown")
+	fmt.Println(content)
+}
+
+func getCommitsAhead(base string) ([]CommitInfo, error) {
+	output, err := runGitCommand("log", "--pretty=format:%H\t%s", base+"..HEAD")
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(output) == "" {
+		return nil, nil
+	}
+
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	commits := make([]CommitInfo, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		commits = append(commits, CommitInfo{
+			Hash:    strings.TrimSpace(parts[0]),
+			Subject: strings.TrimSpace(parts[1]),
+		})
+	}
+
+	return commits, nil
+}
+
+func formatCommitList(commits []CommitInfo) string {
+	lines := make([]string, 0, len(commits))
+	for index, commit := range commits {
+		shortHash := commit.Hash
+		if len(shortHash) > 7 {
+			shortHash = shortHash[:7]
+		}
+		lines = append(lines, fmt.Sprintf("  %s%2d%s  %s  %s", colorDim, index+1, colorReset, shortHash, commit.Subject))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func generatePRMessage(apiKey, model, base string, commits []CommitInfo) (string, error) {
+	payload := chatCompletionRequest{
+		Model:       model,
+		Temperature: 0.2,
+		Messages: []chatMessage{
+			{
+				Role: "system",
+				Content: "You write professional pull request descriptions in Markdown. " +
+					"Return a copy-paste-ready PR message only. Include a short title line at the top, then sections for Summary, Changes, and Testing. " +
+					"Base everything only on the commit history provided. Do not invent changes not implied by the commits.",
+			},
+			{
+				Role:    "user",
+				Content: buildPRPrompt(base, commits),
+			},
+		},
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, groqAPIURL, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	var completion chatCompletionResponse
+	if err := json.Unmarshal(responseBody, &completion); err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode >= 400 {
+		if completion.Error != nil && completion.Error.Message != "" {
+			return "", errors.New(completion.Error.Message)
+		}
+		return "", fmt.Errorf("groq request failed with status %s", resp.Status)
+	}
+
+	if len(completion.Choices) == 0 {
+		return "", errors.New("groq returned no choices")
+	}
+
+	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+}
+
+func buildPRPrompt(base string, commits []CommitInfo) string {
+	var builder strings.Builder
+	builder.WriteString("Generate a pull request message in Markdown based only on these commits.\n")
+	builder.WriteString("Base branch: ")
+	builder.WriteString(base)
+	builder.WriteString("\n\n")
+
+	for _, commit := range commits {
+		builder.WriteString("Commit: ")
+		builder.WriteString(commit.Hash)
+		builder.WriteString("\nSubject: ")
+		builder.WriteString(commit.Subject)
+		builder.WriteString("\n\n")
+	}
+
+	return builder.String()
+}
+
 func printHelp() {
 	printWelcome()
 	printSection("Examples")
@@ -1145,6 +1314,9 @@ func printHelp() {
 		"",
 		"commit group",
 		colorDim + "Direct AI group-wise mode" + colorReset,
+		"",
+		"pr",
+		colorDim + "Generate a Markdown PR message from commits ahead of origin/main" + colorReset,
 		"",
 		"config groq-key <api-key>",
 		fmt.Sprintf("%sconfig groq-model %s%s", colorDim, defaultGroqModel, colorReset),
