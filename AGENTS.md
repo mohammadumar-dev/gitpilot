@@ -1,36 +1,38 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This repository is a small Go CLI application. The current entrypoint is [`main.go`](/home/mohammad-umar/Documents/GitHub/gitpilot/main.go), which contains command dispatch, interactive mode, and Git command helpers. Module metadata lives in [`go.mod`](/home/mohammad-umar/Documents/GitHub/gitpilot/go.mod). The top-level [`README.md`](/home/mohammad-umar/Documents/GitHub/gitpilot/README.md) is minimal and should be updated when user-facing behavior changes.
-
-If the project grows, keep CLI wiring in `main.go` thin and move command logic into focused packages such as `internal/commands` or `internal/git`.
+This repository is a single-binary Go CLI. [`main.go`](/home/mohammad-umar/Documents/GitHub/gitpilot/main.go) currently contains command dispatch, terminal UI helpers, Git integration, Groq API calls, and commit-planning logic. Module metadata lives in [`go.mod`](/home/mohammad-umar/Documents/GitHub/gitpilot/go.mod); top-level docs live in [`README.md`](/home/mohammad-umar/Documents/GitHub/gitpilot/README.md). Keep new behavior consistent with the existing approval-driven commit and push flow.
 
 ## Build, Test, and Development Commands
-Use standard Go tooling from the repository root:
+Use standard Go commands from the repo root:
 
-- `go run .` runs the interactive CLI locally.
-- `go run . status` runs a single command without entering interactive mode.
+- `go run .` starts the interactive CLI.
+- `go run . help` prints current command usage.
+- `go run . init` initializes repo-local Git Pilot settings.
+- `go run . pull` previews and confirms `git pull --ff-only`.
 - `go build -o gitpilot .` builds the binary.
-- `go test ./...` runs all tests once test files are added.
-- `gofmt -w .` formats Go source files in place.
+- `gofmt -w main.go` formats the source.
 
-Run `gofmt` before opening a pull request.
+If Go cache writes fail in restricted environments, use `GOCACHE=/tmp/gocache go build ./...`.
 
 ## Coding Style & Naming Conventions
-Follow default Go conventions: tabs for indentation, exported names in `PascalCase`, unexported helpers in `camelCase`, and short package names. Keep functions focused; `main.go` currently mixes CLI and Git logic, so new work should prefer small helpers or new packages rather than longer switch blocks.
+Follow standard Go formatting and naming: tabs, `PascalCase` for exported identifiers, `camelCase` for internal helpers. Prefer focused helpers for UI (`printPanel`, `printSection`), Git operations, and AI prompts instead of growing one large command function further.
 
-Use Go’s standard formatter instead of manual alignment. Prefer descriptive command names such as `executeStatus` and data types such as `FileChange`.
+Terminal UX matters here. Preserve the modern CLI style: structured panels, concise status messages, and explicit confirmation prompts before any mutating Git action.
 
 ## Testing Guidelines
-There is no test suite yet. Add table-driven unit tests in `*_test.go` files alongside the code they cover. Use Go’s `testing` package and run `go test ./...` before submitting changes.
+There is no automated test suite yet. Validate changes with targeted manual runs such as:
 
-For Git command execution, prefer tests around helper functions and error handling rather than fragile end-to-end shell assumptions.
+- `go run . help`
+- `go run . diff`
+- `go run . init`
+- `go run . pull`
+- `go run . push`
+
+For commit-flow changes, test both missing-key behavior and an approval/cancel path. Add `*_test.go` files for pure helpers where practical.
+
+## Configuration Notes
+Groq settings are read from `GROQ_API_KEY`, `GROQ_MODEL`, or local Git config keys `gitpilot.groq-api-key` and `gitpilot.groq-model`. `init` also writes `gitpilot.initialized`. Avoid changing these keys without updating the CLI and README together.
 
 ## Commit & Pull Request Guidelines
-Recent commit messages use imperative mood and concise summaries, for example: `Add initial implementation of Git Pilot CLI with command handling` and `Refactor command handling to support interactive mode and improve user prompts`.
-
-Keep commits focused and descriptive. Pull requests should include:
-
-- A short description of the behavioral change.
-- Any manual test steps used, such as `go run .` or `go build -o gitpilot .`.
-- Terminal output or screenshots only when CLI behavior or prompts changed.
+Use short imperative commit subjects, preferably conventional prefixes like `feat:`, `fix:`, or `refactor:`. PRs should include the user-facing behavior change, the commands used for verification, and screenshots or terminal snippets when the CLI output changed.
