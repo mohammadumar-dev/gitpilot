@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 )
 
 func printWelcome() {
@@ -12,9 +13,22 @@ func printWelcome() {
 
 func readCommand() string {
 	var cmd string
-	fmt.Print("Enter command: ")
+	fmt.Print("git-pilot> ")
 	fmt.Scanln(&cmd)
 	return cmd
+}
+
+func runInteractive() {
+	for {
+		cmd := readCommand()
+
+		if cmd == "exit" {
+			fmt.Println("Goodbye!")
+			break
+		}
+
+		executeCommand(cmd)
+	}
 }
 
 func executeCommand(cmd string) {
@@ -70,6 +84,10 @@ func printHelp() {
 func main() {
 	printWelcome()
 
-	cmd := readCommand()
-	executeCommand(cmd)
+	if (len(os.Args) > 1) {
+		cmd := os.Args[1]
+		executeCommand(cmd)
+	} else {
+		runInteractive()
+	}
 }
