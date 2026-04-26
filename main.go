@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,18 @@ import (
 const (
 	defaultGroqModel = "llama-3.3-70b-versatile"
 	groqAPIURL       = "https://api.groq.com/openai/v1/chat/completions"
+	groqAPIKeyConfig = "gitpilot.groq-api-key"
+	groqModelConfig  = "gitpilot.groq-model"
+	initConfigKey    = "gitpilot.initialized"
+	colorReset       = "\033[0m"
+	colorDim         = "\033[38;5;245m"
+	colorBorder      = "\033[38;5;240m"
+	colorAccent      = "\033[38;5;111m"
+	colorInfo        = "\033[38;5;117m"
+	colorSuccess     = "\033[38;5;114m"
+	colorWarn        = "\033[38;5;221m"
+	colorError       = "\033[38;5;203m"
+	colorStrong      = "\033[1m"
 )
 
 type FileChange struct {
@@ -63,18 +76,108 @@ type commitRunSummary struct {
 }
 
 func printWelcome() {
-	fmt.Println("Welcome to Git Pilot! Your AI-powered Git assistant.")
-	fmt.Println("Commands:")
-	fmt.Println("init, status, diff, commit, push, pull, config, help")
+	printPanel([]string{
+		colorStrong + "Git Pilot" + colorReset,
+		colorDim + "AI-assisted Git workflow for structured commits and push approvals" + colorReset,
+		"",
+		colorDim + "Commands: init, status, diff, commit, push, pull, config, help, exit" + colorReset,
+	})
+}
+
+func printSection(title string) {
+	fmt.Printf("\n%s──%s %s%s%s\n", colorBorder, colorReset, colorStrong, title, colorReset)
+}
+
+func printSuccess(message string) {
+	fmt.Printf("%s●%s %s%s%s\n", colorSuccess, colorReset, colorSuccess, message, colorReset)
+}
+
+func printWarning(message string) {
+	fmt.Printf("%s●%s %s%s%s\n", colorWarn, colorReset, colorWarn, message, colorReset)
+}
+
+func printError(message string) {
+	fmt.Printf("%s●%s %s%s%s\n", colorError, colorReset, colorError, message, colorReset)
+}
+
+func printInfo(message string) {
+	fmt.Printf("%s●%s %s%s%s\n", colorInfo, colorReset, colorInfo, message, colorReset)
+}
+
+func printPanel(lines []string) {
+	expanded := make([]string, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.Split(line, "\n")
+		expanded = append(expanded, parts...)
+	}
+
+	width := 0
+	for _, line := range expanded {
+		if len(stripANSI(line)) > width {
+			width = len(stripANSI(line))
+		}
+	}
+	if width < 24 {
+		width = 24
+	}
+
+	fmt.Printf("%s╭%s╮%s\n", colorBorder, strings.Repeat("─", width+2), colorReset)
+	for _, line := range expanded {
+		padding := width - len(stripANSI(line))
+		fmt.Printf("%s│%s %s%s %s│%s\n", colorBorder, colorReset, line, strings.Repeat(" ", padding), colorBorder, colorReset)
+	}
+	fmt.Printf("%s╰%s╯%s\n", colorBorder, strings.Repeat("─", width+2), colorReset)
+}
+
+func stripANSI(text string) string {
+	var builder strings.Builder
+	inEscape := false
+
+	for _, r := range text {
+		if r == '\033' {
+			inEscape = true
+			continue
+		}
+		if inEscape {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEscape = false
+			}
+			continue
+		}
+		builder.WriteRune(r)
+	}
+
+	return builder.String()
+}
+
+func styleStatus(status string) string {
+	switch {
+	case strings.Contains(status, "?"):
+		return colorInfo + "new     " + colorReset
+	case strings.Contains(status, "A"):
+		return colorSuccess + "added   " + colorReset
+	case strings.Contains(status, "M"):
+		return colorWarn + "modified" + colorReset
+	case strings.Contains(status, "D"):
+		return colorError + "deleted " + colorReset
+	case strings.Contains(status, "R"):
+		return colorAccent + "renamed " + colorReset
+	default:
+		return colorDim + status + colorReset
+	}
+}
+
+func renderChoice(index int, title, description string) string {
+	return fmt.Sprintf("%s[%d]%s %s%s%s\n    %s%s%s", colorAccent, index, colorReset, colorStrong, title, colorReset, colorDim, description, colorReset)
 }
 
 func readCommand() []string {
 	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("gitpilot> ")
+	fmt.Printf("%s%sgitpilot%s %s›%s ", colorAccent, colorStrong, colorReset, colorBorder, colorReset)
 
 	line, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		fmt.Println("❌ Failed to read command:", err)
+		printError("Failed to read command: " + err.Error())
 		return nil
 	}
 
@@ -123,7 +226,7 @@ func executeCommand(args []string) {
 	case "help":
 		printHelp()
 	default:
-		fmt.Println("❌ Invalid command. Type 'help'")
+		printError("Invalid command. Type 'help'")
 	}
 }
 
@@ -172,7 +275,7 @@ func getChangedFiles() ([]FileChange, error) {
 
 		diff, diffErr := getDiffForFile(path, status)
 		if diffErr != nil {
-			fmt.Println("⚠️ Skipping file:", path)
+			printWarning("Skipping file: " + path)
 			continue
 		}
 
@@ -245,24 +348,65 @@ func filterChanges(changes []FileChange, targets []string) ([]FileChange, error)
 }
 
 func executeInit() {
-	fmt.Println("Initializing repository...")
+	printSection("Init")
+
+	if _, err := runGitCommand("rev-parse", "--is-inside-work-tree"); err != nil {
+		printError("Current directory is not a Git repository.")
+		return
+	}
+
+	branch, _ := runGitCommand("branch", "--show-current")
+	remoteName := getDefaultRemoteName()
+	model := strings.TrimSpace(getGroqModel())
+
+	if _, err := runGitCommand("config", "--get", groqModelConfig); err != nil {
+		if err := setGitConfig(groqModelConfig, defaultGroqModel); err != nil {
+			printError("Failed to save default Groq model: " + err.Error())
+			return
+		}
+		model = defaultGroqModel
+	}
+
+	if _, err := runGitCommand("config", "--get", initConfigKey); err != nil {
+		if err := setGitConfig(initConfigKey, "true"); err != nil {
+			printError("Failed to save Git Pilot initialization state: " + err.Error())
+			return
+		}
+	}
+
+	printPanel([]string{
+		colorStrong + "Repository ready for Git Pilot" + colorReset,
+		colorDim + "Branch" + colorReset + "  " + strings.TrimSpace(branch),
+		colorDim + "Remote" + colorReset + "  " + remoteName,
+		colorDim + "Model" + colorReset + "   " + model,
+	})
+
+	if _, err := getGroqAPIKey(); err != nil {
+		printWarning("Groq API key is not configured yet.")
+		fmt.Println("Set GROQ_API_KEY or run: config groq-key <your-key>")
+		return
+	}
+
+	printSuccess("Groq API key detected.")
 }
 
 func executeStatus() {
-	fmt.Println("Checking repository status...")
+	printSection("Repository Status")
 
 	output, err := runGitCommand("status")
 	if err != nil {
-		fmt.Println("⚠️ Git error:")
+		printWarning("Git returned an error.")
 	}
 
 	fmt.Println(output)
 }
 
 func executeDiff() {
+	printSection("Changed Files")
+
 	changes, err := getChangedFiles()
 	if err != nil {
-		fmt.Println("❌ Error:", err)
+		printError(err.Error())
 		return
 	}
 
@@ -271,16 +415,21 @@ func executeDiff() {
 		return
 	}
 
-	fmt.Println("Changed files:")
-	for _, change := range changes {
-		fmt.Printf("- %s [%s]\n", change.FileName, change.Status)
+	lines := []string{
+		fmt.Sprintf("%s%d file(s) changed%s", colorStrong, len(changes), colorReset),
 	}
+	for index, change := range changes {
+		lines = append(lines, fmt.Sprintf("%s%2d%s  %s  %s", colorDim, index+1, colorReset, styleStatus(change.Status), change.FileName))
+	}
+	printPanel(lines)
 }
 
 func executeCommit(args []string) {
+	printSection("Commit Session")
+
 	changes, err := getChangedFiles()
 	if err != nil {
-		fmt.Println("❌ Error:", err)
+		printError(err.Error())
 		return
 	}
 
@@ -291,7 +440,7 @@ func executeCommit(args []string) {
 
 	apiKey, err := getGroqAPIKey()
 	if err != nil {
-		fmt.Println("❌", err)
+		printError(err.Error())
 		fmt.Println("Set GROQ_API_KEY or run: config groq-key <your-key>")
 		return
 	}
@@ -306,43 +455,51 @@ func executeCommit(args []string) {
 	} else {
 		mode = promptCommitMode()
 		if mode == "" {
-			fmt.Println("Commit cancelled.")
+			printWarning("Commit cancelled.")
 			return
 		}
 	}
 
 	plans, err := buildCommitPlans(apiKey, model, mode, changes, targets)
 	if err != nil {
-		fmt.Println("❌", err)
+		printError(err.Error())
 		return
 	}
 
 	summary := commitRunSummary{Mode: mode}
+	printInfo("Planned commits: " + strconv.Itoa(len(plans)))
 
-	for _, plan := range plans {
-		fmt.Printf("\nGenerating commit message for %s...\n", plan.Label)
+	for index, plan := range plans {
+		printSection(fmt.Sprintf("Commit %d of %d", index+1, len(plans)))
+		printPanel([]string{
+			colorStrong + plan.Label + colorReset,
+			colorDim + strconv.Itoa(len(plan.Changes)) + " file(s) in this commit" + colorReset,
+			"",
+			formatFilesForDisplay(plan.Changes),
+		})
+		printInfo("Generating AI commit message...")
 
 		message, err := generateCommitMessage(apiKey, model, plan.Changes)
 		if err != nil {
-			fmt.Println("❌ AI generation failed:", err)
+			printError("AI generation failed: " + err.Error())
 			summary.Failed = append(summary.Failed, plan.Label)
 			continue
 		}
 
 		printCommitPreview(plan, message)
 		if !approveCommit(plan, message) {
-			fmt.Println("Skipped.")
+			printWarning("Commit skipped.")
 			summary.Skipped = append(summary.Skipped, plan.Label)
 			continue
 		}
 
 		if err := performCommit(mode, plan.Changes, message); err != nil {
-			fmt.Println("❌ Commit failed:", err)
+			printError("Commit failed: " + err.Error())
 			summary.Failed = append(summary.Failed, plan.Label)
 			continue
 		}
 
-		fmt.Println("Committed.")
+		printSuccess("Commit created.")
 		summary.Committed = append(summary.Committed, fmt.Sprintf("%s -> %s", plan.Label, message))
 	}
 
@@ -356,14 +513,15 @@ func promptCommitMode() string {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Println("\nHow do you want to commit these changes?")
-		fmt.Println("1. File wise")
-		fmt.Println("2. Group wise (AI categories)")
-		fmt.Print("Choose 1 or 2: ")
+		printSection("Commit Mode")
+		fmt.Println("How do you want to split these commits?")
+		fmt.Println(renderChoice(1, "File wise", "One commit per changed file."))
+		fmt.Println(renderChoice(2, "Group wise", "AI groups related files into logical commit categories."))
+		fmt.Printf("%sSelect mode%s %s(1/2)%s: ", colorStrong, colorReset, colorDim, colorReset)
 
 		answer, err := reader.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			fmt.Println("❌ Failed to read choice:", err)
+			printError("Failed to read choice: " + err.Error())
 			return ""
 		}
 
@@ -377,7 +535,7 @@ func promptCommitMode() string {
 				return ""
 			}
 		default:
-			fmt.Println("Please choose 1 or 2.")
+			printWarning("Please choose 1 or 2.")
 		}
 	}
 }
@@ -431,9 +589,12 @@ func buildCommitPlans(apiKey, model, mode string, changes []FileChange, targets 
 }
 
 func printCommitPreview(plan CommitPlan, message string) {
-	fmt.Printf("Target: %s\n", plan.Label)
-	fmt.Printf("Files: %s\n", formatFileList(plan.Changes))
-	fmt.Printf("Message: %s\n", message)
+	printPanel([]string{
+		colorStrong + "Commit Preview" + colorReset,
+		colorDim + "Target" + colorReset + "  " + plan.Label,
+		colorDim + "Files" + colorReset + "   " + formatFileList(plan.Changes),
+		colorDim + "Message" + colorReset + " " + colorAccent + message + colorReset,
+	})
 }
 
 func approveCommit(plan CommitPlan, message string) bool {
@@ -442,7 +603,7 @@ func approveCommit(plan CommitPlan, message string) bool {
 
 	answer, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		fmt.Println("❌ Failed to read approval:", err)
+		printError("Failed to read approval: " + err.Error())
 		return false
 	}
 
@@ -456,7 +617,7 @@ func promptYesNo(prompt string) bool {
 
 	answer, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
-		fmt.Println("❌ Failed to read approval:", err)
+		printError("Failed to read approval: " + err.Error())
 		return false
 	}
 
@@ -658,31 +819,43 @@ func parseCommitGroups(content string) ([]commitGroupProposal, error) {
 }
 
 func printCommitSummary(summary commitRunSummary) {
-	fmt.Println("\nCommit session summary")
-	fmt.Println("Mode:", summary.Mode)
-	fmt.Printf("Committed: %d\n", len(summary.Committed))
-	for _, item := range summary.Committed {
-		fmt.Println("- " + item)
+	printSection("Commit Session Summary")
+	lines := []string{
+		colorDim + "Mode" + colorReset + "      " + summary.Mode,
+		colorSuccess + "Committed" + colorReset + " " + strconv.Itoa(len(summary.Committed)),
+		colorWarn + "Skipped" + colorReset + "   " + strconv.Itoa(len(summary.Skipped)),
+		colorError + "Failed" + colorReset + "    " + strconv.Itoa(len(summary.Failed)),
 	}
-	fmt.Printf("Skipped: %d\n", len(summary.Skipped))
-	for _, item := range summary.Skipped {
-		fmt.Println("- " + item)
+	if len(summary.Committed) > 0 {
+		lines = append(lines, "", colorStrong+"Created"+colorReset)
+		for _, item := range summary.Committed {
+			lines = append(lines, "  + "+item)
+		}
 	}
-	fmt.Printf("Failed: %d\n", len(summary.Failed))
-	for _, item := range summary.Failed {
-		fmt.Println("- " + item)
+	if len(summary.Skipped) > 0 {
+		lines = append(lines, "", colorStrong+"Skipped"+colorReset)
+		for _, item := range summary.Skipped {
+			lines = append(lines, "  - "+item)
+		}
 	}
+	if len(summary.Failed) > 0 {
+		lines = append(lines, "", colorStrong+"Failed"+colorReset)
+		for _, item := range summary.Failed {
+			lines = append(lines, "  x "+item)
+		}
+	}
+	printPanel(lines)
 }
 
 func promptPushAfterCommits() {
-	fmt.Println("\nCommit session finished.")
+	printSection("Push")
 	if !promptYesNo("Push committed changes now? [y/N]: ") {
-		fmt.Println("Push skipped.")
+		printWarning("Push skipped.")
 		return
 	}
 
 	if err := executePush(); err != nil {
-		fmt.Println("❌ Push failed:", err)
+		printError("Push failed: " + err.Error())
 	}
 }
 
@@ -692,6 +865,14 @@ func formatFileList(changes []FileChange) string {
 		names = append(names, change.FileName)
 	}
 	return strings.Join(names, ", ")
+}
+
+func formatFilesForDisplay(changes []FileChange) string {
+	lines := make([]string, 0, len(changes))
+	for _, change := range changes {
+		lines = append(lines, fmt.Sprintf("  %s %s", styleStatus(change.Status), change.FileName))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func generateCommitMessage(apiKey, model string, changes []FileChange) (string, error) {
@@ -777,7 +958,7 @@ func getGroqAPIKey() (string, error) {
 		return key, nil
 	}
 
-	output, err := runGitCommand("config", "--get", "gitpilot.groqApiKey")
+	output, err := runGitCommand("config", "--get", groqAPIKeyConfig)
 	if err == nil {
 		if key := strings.TrimSpace(output); key != "" {
 			return key, nil
@@ -792,7 +973,7 @@ func getGroqModel() string {
 		return model
 	}
 
-	output, err := runGitCommand("config", "--get", "gitpilot.groqModel")
+	output, err := runGitCommand("config", "--get", groqModelConfig)
 	if err == nil {
 		if model := strings.TrimSpace(output); model != "" {
 			return model
@@ -804,6 +985,7 @@ func getGroqModel() string {
 
 func executeConfig(args []string) {
 	if len(args) == 0 {
+		printSection("Config")
 		fmt.Println("Usage:")
 		fmt.Println("config groq-key <api-key>")
 		fmt.Println("config groq-model <model>")
@@ -817,25 +999,25 @@ func executeConfig(args []string) {
 			fmt.Println("Usage: config groq-key <api-key>")
 			return
 		}
-		if err := setGitConfig("gitpilot.groqApiKey", args[1]); err != nil {
-			fmt.Println("❌ Failed to save Groq API key:", err)
+		if err := setGitConfig(groqAPIKeyConfig, args[1]); err != nil {
+			printError("Failed to save Groq API key: " + err.Error())
 			return
 		}
-		fmt.Println("Saved Groq API key to local git config.")
+		printSuccess("Saved Groq API key to local git config.")
 	case "groq-model":
 		if len(args) < 2 {
 			fmt.Println("Usage: config groq-model <model>")
 			return
 		}
-		if err := setGitConfig("gitpilot.groqModel", args[1]); err != nil {
-			fmt.Println("❌ Failed to save Groq model:", err)
+		if err := setGitConfig(groqModelConfig, args[1]); err != nil {
+			printError("Failed to save Groq model: " + err.Error())
 			return
 		}
-		fmt.Println("Saved Groq model to local git config.")
+		printSuccess("Saved Groq model to local git config.")
 	case "show":
 		printConfig()
 	default:
-		fmt.Println("❌ Unknown config option.")
+		printError("Unknown config option.")
 	}
 }
 
@@ -845,31 +1027,53 @@ func setGitConfig(key, value string) error {
 }
 
 func printConfig() {
+	printSection("Config")
 	keySource := "missing"
 	if strings.TrimSpace(os.Getenv("GROQ_API_KEY")) != "" {
 		keySource = "environment"
-	} else if key, err := runGitCommand("config", "--get", "gitpilot.groqApiKey"); err == nil && strings.TrimSpace(key) != "" {
+	} else if key, err := runGitCommand("config", "--get", groqAPIKeyConfig); err == nil && strings.TrimSpace(key) != "" {
 		keySource = "git config"
 	}
 
-	fmt.Println("Groq key source:", keySource)
-	fmt.Println("Groq model:", getGroqModel())
+	printPanel([]string{
+		colorDim + "Groq key source" + colorReset + "  " + keySource,
+		colorDim + "Groq model" + colorReset + "       " + getGroqModel(),
+	})
+}
+
+func getDefaultRemoteName() string {
+	output, err := runGitCommand("remote")
+	if err != nil {
+		return "missing"
+	}
+
+	for _, remote := range strings.Split(strings.TrimSpace(output), "\n") {
+		remote = strings.TrimSpace(remote)
+		if remote != "" {
+			return remote
+		}
+	}
+
+	return "missing"
 }
 
 func executePush() error {
-	fmt.Println("Push preview:")
+	printSection("Push Preview")
 
 	statusOutput, statusErr := runGitCommand("status", "--short", "--branch")
 	if statusErr == nil && strings.TrimSpace(statusOutput) != "" {
-		fmt.Println(statusOutput)
+		printPanel([]string{
+			colorStrong + "Repository state" + colorReset,
+			colorDim + strings.TrimSpace(statusOutput) + colorReset,
+		})
 	}
 
 	if !promptYesNo("Approve push? [y/N]: ") {
-		fmt.Println("Push cancelled.")
+		printWarning("Push cancelled.")
 		return nil
 	}
 
-	fmt.Println("Pushing to remote...")
+	fmt.Println("Running git push...")
 	output, err := runGitCommand("push")
 	if strings.TrimSpace(output) != "" {
 		fmt.Println(output)
@@ -878,23 +1082,73 @@ func executePush() error {
 		return err
 	}
 
-	fmt.Println("Push completed.")
+	printSuccess("Push completed.")
 	return nil
 }
 
 func executePull() {
-	fmt.Println("Pulling latest changes...")
+	printSection("Pull Preview")
+
+	branchOutput, branchErr := runGitCommand("branch", "--show-current")
+	branch := strings.TrimSpace(branchOutput)
+	if branchErr != nil || branch == "" {
+		branch = "(unknown)"
+	}
+
+	remote := getDefaultRemoteName()
+	statusOutput, statusErr := runGitCommand("status", "--short", "--branch")
+
+	lines := []string{
+		colorStrong + "Pull target" + colorReset,
+		colorDim + "Remote" + colorReset + "  " + remote,
+		colorDim + "Branch" + colorReset + "  " + branch,
+	}
+
+	if statusErr == nil && strings.TrimSpace(statusOutput) != "" {
+		lines = append(lines, "", colorStrong+"Repository state"+colorReset, colorDim+strings.TrimSpace(statusOutput)+colorReset)
+	}
+
+	printPanel(lines)
+
+	if remote == "missing" {
+		printError("No Git remote is configured.")
+		return
+	}
+
+	if !promptYesNo("Approve pull? [y/N]: ") {
+		printWarning("Pull cancelled.")
+		return
+	}
+
+	printInfo("Running git pull --ff-only...")
+	output, err := runGitCommand("pull", "--ff-only", remote, branch)
+	if strings.TrimSpace(output) != "" {
+		fmt.Println(output)
+	}
+	if err != nil {
+		printError("Pull failed: " + err.Error())
+		return
+	}
+
+	printSuccess("Pull completed.")
 }
 
 func printHelp() {
 	printWelcome()
-	fmt.Println("Examples:")
-	fmt.Println("commit                  # asks file wise vs AI group wise")
-	fmt.Println("commit file main.go     # direct file-wise mode")
-	fmt.Println("commit group            # direct AI group-wise mode")
-	fmt.Println("commit group main.go go.mod")
-	fmt.Println("config groq-key <api-key>")
-	fmt.Printf("config groq-model %s\n", defaultGroqModel)
+	printSection("Examples")
+	printPanel([]string{
+		"commit",
+		colorDim + "Interactive commit session with approval per commit" + colorReset,
+		"",
+		"commit file main.go",
+		colorDim + "Direct file-wise mode for selected files" + colorReset,
+		"",
+		"commit group",
+		colorDim + "Direct AI group-wise mode" + colorReset,
+		"",
+		"config groq-key <api-key>",
+		fmt.Sprintf("%sconfig groq-model %s%s", colorDim, defaultGroqModel, colorReset),
+	})
 }
 
 func main() {
