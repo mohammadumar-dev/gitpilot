@@ -51,19 +51,19 @@ changelog:
       - Merge pull request
       - Merge branch
 
-brews:
-  - name: gitpilot
-    repository:
-      owner: mohammadumar-dev
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    commit_author:
-      name: goreleaserbot
-      email: bot@goreleaser.com
-    homepage: "https://github.com/mohammadumar-dev/gitpilot"
-    description: "AI-assisted Git workflow CLI for structured commits and push approvals"
-    license: "MIT"
-    install: |
-      bin.install "gitpilot"
-    test: |
-      system "#{bin}/gitpilot", "version"
+# brews: (enable after creating mohammadumar-dev/homebrew-tap repo and adding HOMEBREW_TAP_GITHUB_TOKEN secret)
+#   - name: gitpilot
+#     repository:
+#       owner: mohammadumar-dev
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+#     commit_author:
+#       name: goreleaserbot
+#       email: bot@goreleaser.com
+#     homepage: "https://github.com/mohammadumar-dev/gitpilot"
+#     description: "AI-assisted Git workflow CLI for structured commits and push approvals"
+#     license: "MIT"
+#     install: |
+#       bin.install "gitpilot"
+#     test: |
+#       system "#{bin}/gitpilot", "version"
