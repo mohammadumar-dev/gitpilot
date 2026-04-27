@@ -10,10 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
+
+var version = "dev"
 
 const (
 	defaultGroqModel = "llama-3.3-70b-versatile"
@@ -21,6 +25,8 @@ const (
 	groqAPIKeyConfig = "gitpilot.groq-api-key"
 	groqModelConfig  = "gitpilot.groq-model"
 	initConfigKey    = "gitpilot.initialized"
+	keychainService  = "gitpilot"
+	keychainAccount  = "groq-api-key"
 	colorReset       = "\033[0m"
 	colorDim         = "\033[38;5;245m"
 	colorBorder      = "\033[38;5;240m"
@@ -85,7 +91,7 @@ func printWelcome() {
 		colorStrong + "Git Pilot" + colorReset,
 		colorDim + "AI-assisted Git workflow for structured commits and push approvals" + colorReset,
 		"",
-		colorDim + "Commands: init, status, diff, commit, push, pull, pr, config, help, exit" + colorReset,
+		colorDim + "Commands: auth, init, status, diff, commit, push, pull, pr, config, version, help, exit" + colorReset,
 	})
 }
 
@@ -226,12 +232,16 @@ func executeCommand(args []string) {
 		}
 	case "pull":
 		executePull()
+	case "auth":
+		executeAuth(args[1:])
 	case "config":
 		executeConfig(args[1:])
 	case "pr":
 		executePR(args[1:])
 	case "help":
 		printHelp()
+	case "version":
+		fmt.Printf("gitpilot %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
 	default:
 		printError("Invalid command. Type 'help'")
 	}
@@ -960,19 +970,264 @@ func buildCommitPrompt(changes []FileChange) string {
 	return builder.String()
 }
 
+func getConfigDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "gitpilot")
+}
+
+func getCredentialsPath() string {
+	return filepath.Join(getConfigDir(), "credentials")
+}
+
+func readPassword(prompt string) (string, error) {
+	fmt.Print(prompt)
+	if runtime.GOOS != "windows" {
+		off := exec.Command("stty", "-echo")
+		off.Stdin = os.Stdin
+		_ = off.Run()
+		defer func() {
+			on := exec.Command("stty", "echo")
+			on.Stdin = os.Stdin
+			_ = on.Run()
+			fmt.Println()
+		}()
+	}
+	reader := bufio.NewReader(os.Stdin)
+	pass, err := reader.ReadString('\n')
+	return strings.TrimRight(pass, "\r\n"), err
+}
+
+func keychainRead() (string, error) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("security", "find-generic-password",
+			"-s", keychainService, "-a", keychainAccount, "-w")
+	case "linux":
+		cmd = exec.Command("secret-tool", "lookup",
+			"service", keychainService, "account", keychainAccount)
+	case "windows":
+		script := `[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]|Out-Null;` +
+			`$v=New-Object Windows.Security.Credentials.PasswordVault;` +
+			`$c=$v.Retrieve('gitpilot','groq-api-key');$c.RetrievePassword();$c.Password`
+		cmd = exec.Command("powershell", "-NonInteractive", "-Command", script)
+	default:
+		return "", errors.New("keychain not supported")
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func keychainWrite(key string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("security", "add-generic-password",
+			"-U", "-s", keychainService, "-a", keychainAccount, "-w", key).Run()
+	case "linux":
+		cmd := exec.Command("secret-tool", "store",
+			"--label=gitpilot Groq API key",
+			"service", keychainService, "account", keychainAccount)
+		cmd.Stdin = strings.NewReader(key)
+		return cmd.Run()
+	case "windows":
+		script := fmt.Sprintf(
+			`[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]|Out-Null;`+
+				`$v=New-Object Windows.Security.Credentials.PasswordVault;`+
+				`$c=New-Object Windows.Security.Credentials.PasswordCredential('gitpilot','groq-api-key','%s');`+
+				`$v.Add($c)`, key)
+		return exec.Command("powershell", "-NonInteractive", "-Command", script).Run()
+	default:
+		return errors.New("keychain not supported")
+	}
+}
+
+func keychainDelete() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("security", "delete-generic-password",
+			"-s", keychainService, "-a", keychainAccount).Run()
+	case "linux":
+		return exec.Command("secret-tool", "clear",
+			"service", keychainService, "account", keychainAccount).Run()
+	case "windows":
+		script := `[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]|Out-Null;` +
+			`$v=New-Object Windows.Security.Credentials.PasswordVault;` +
+			`try{$c=$v.Retrieve('gitpilot','groq-api-key');$v.Remove($c)}catch{}`
+		return exec.Command("powershell", "-NonInteractive", "-Command", script).Run()
+	default:
+		return errors.New("keychain not supported")
+	}
+}
+
+func credFileRead() (string, error) {
+	data, err := os.ReadFile(getCredentialsPath())
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "groq_api_key=") {
+			return strings.TrimPrefix(line, "groq_api_key="), nil
+		}
+	}
+	return "", errors.New("key not found in credentials file")
+}
+
+func credFileWrite(key string) error {
+	dir := getConfigDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(getCredentialsPath(), []byte("groq_api_key="+key+"\n"), 0600)
+}
+
+func credFileDelete() error {
+	return os.Remove(getCredentialsPath())
+}
+
+func validateGroqKey(key string) error {
+	req, err := http.NewRequest("GET", "https://api.groq.com/openai/v1/models", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode == 401 {
+		return errors.New("invalid API key (401 Unauthorized)")
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func maskKey(key string) string {
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "****" + key[len(key)-4:]
+}
+
 func getGroqAPIKey() (string, error) {
+	// 1. Environment variable — CI/CD or explicit override
 	if key := strings.TrimSpace(os.Getenv("GROQ_API_KEY")); key != "" {
 		return key, nil
 	}
+	// 2. OS keychain (macOS Keychain / Linux libsecret / Windows Credential Manager)
+	if key, err := keychainRead(); err == nil && key != "" {
+		return key, nil
+	}
+	// 3. ~/.config/gitpilot/credentials (chmod 0600)
+	if key, err := credFileRead(); err == nil && key != "" {
+		return key, nil
+	}
+	return "", errors.New("not authenticated — run: gitpilot auth login")
+}
 
-	output, err := runGitCommand("config", "--get", groqAPIKeyConfig)
-	if err == nil {
-		if key := strings.TrimSpace(output); key != "" {
-			return key, nil
-		}
+func executeAuth(args []string) {
+	if len(args) == 0 {
+		printSection("Auth")
+		fmt.Println("Usage:")
+		fmt.Println("  auth login    Store Groq API key securely")
+		fmt.Println("  auth logout   Remove stored API key")
+		fmt.Println("  auth status   Show authentication state")
+		return
+	}
+	switch args[0] {
+	case "login":
+		executeAuthLogin()
+	case "logout":
+		executeAuthLogout()
+	case "status":
+		executeAuthStatus()
+	default:
+		printError("Unknown auth subcommand: " + args[0])
+	}
+}
+
+func executeAuthLogin() {
+	printSection("Authentication")
+	fmt.Println(colorDim + "Get your Groq API key from: https://console.groq.com/keys" + colorReset)
+	fmt.Println()
+
+	key, err := readPassword("Paste your API key (input hidden): ")
+	if err != nil || strings.TrimSpace(key) == "" {
+		printError("No key entered.")
+		return
+	}
+	key = strings.TrimSpace(key)
+
+	fmt.Print(colorDim + "Validating key..." + colorReset)
+	if err := validateGroqKey(key); err != nil {
+		fmt.Println()
+		printError("Validation failed: " + err.Error())
+		return
+	}
+	fmt.Println(" " + colorSuccess + "✓" + colorReset)
+
+	keychainNames := map[string]string{
+		"darwin":  "macOS Keychain",
+		"linux":   "GNOME Keyring (libsecret)",
+		"windows": "Windows Credential Manager",
 	}
 
-	return "", errors.New("Groq API key is not configured")
+	if err := keychainWrite(key); err == nil {
+		printSuccess("Stored in " + keychainNames[runtime.GOOS])
+	} else {
+		if err2 := credFileWrite(key); err2 != nil {
+			printError("Failed to store key: " + err2.Error())
+			return
+		}
+		printSuccess("Stored in " + getCredentialsPath() + " (chmod 0600)")
+	}
+}
+
+func executeAuthLogout() {
+	removed := false
+	if keychainDelete() == nil {
+		removed = true
+	}
+	if credFileDelete() == nil {
+		removed = true
+	}
+	if removed {
+		printSuccess("API key removed.")
+	} else {
+		printWarning("No stored key found.")
+	}
+}
+
+func executeAuthStatus() {
+	printSection("Auth Status")
+	if key := strings.TrimSpace(os.Getenv("GROQ_API_KEY")); key != "" {
+		printSuccess("Authenticated via environment variable (" + maskKey(key) + ")")
+		return
+	}
+	if key, err := keychainRead(); err == nil && key != "" {
+		names := map[string]string{
+			"darwin":  "macOS Keychain",
+			"linux":   "GNOME Keyring",
+			"windows": "Windows Credential Manager",
+		}
+		printSuccess("Authenticated via " + names[runtime.GOOS] + " (" + maskKey(key) + ")")
+		return
+	}
+	if key, err := credFileRead(); err == nil && key != "" {
+		printSuccess("Authenticated via credentials file (" + maskKey(key) + ")")
+		return
+	}
+	printWarning("Not authenticated — run: gitpilot auth login")
 }
 
 func getGroqModel() string {
@@ -994,23 +1249,16 @@ func executeConfig(args []string) {
 	if len(args) == 0 {
 		printSection("Config")
 		fmt.Println("Usage:")
-		fmt.Println("config groq-key <api-key>")
-		fmt.Println("config groq-model <model>")
-		fmt.Println("config show")
+		fmt.Println("  config groq-model <model>   Set the Groq model")
+		fmt.Println("  config show                 Show current config")
+		fmt.Println()
+		fmt.Println("To manage your API key use: gitpilot auth login")
 		return
 	}
 
 	switch args[0] {
 	case "groq-key":
-		if len(args) < 2 {
-			fmt.Println("Usage: config groq-key <api-key>")
-			return
-		}
-		if err := setGitConfig(groqAPIKeyConfig, args[1]); err != nil {
-			printError("Failed to save Groq API key: " + err.Error())
-			return
-		}
-		printSuccess("Saved Groq API key to local git config.")
+		printWarning("'config groq-key' is deprecated — use: gitpilot auth login")
 	case "groq-model":
 		if len(args) < 2 {
 			fmt.Println("Usage: config groq-model <model>")
@@ -1035,11 +1283,18 @@ func setGitConfig(key, value string) error {
 
 func printConfig() {
 	printSection("Config")
-	keySource := "missing"
+	keySource := "not set — run: gitpilot auth login"
 	if strings.TrimSpace(os.Getenv("GROQ_API_KEY")) != "" {
-		keySource = "environment"
-	} else if key, err := runGitCommand("config", "--get", groqAPIKeyConfig); err == nil && strings.TrimSpace(key) != "" {
-		keySource = "git config"
+		keySource = "environment variable"
+	} else if _, err := keychainRead(); err == nil {
+		names := map[string]string{
+			"darwin":  "macOS Keychain",
+			"linux":   "GNOME Keyring",
+			"windows": "Windows Credential Manager",
+		}
+		keySource = names[runtime.GOOS]
+	} else if _, err := credFileRead(); err == nil {
+		keySource = getCredentialsPath()
 	}
 
 	printPanel([]string{
@@ -1318,8 +1573,14 @@ func printHelp() {
 		"pr",
 		colorDim + "Generate a Markdown PR message from commits ahead of origin/main" + colorReset,
 		"",
-		"config groq-key <api-key>",
-		fmt.Sprintf("%sconfig groq-model %s%s", colorDim, defaultGroqModel, colorReset),
+		"auth login",
+		colorDim + "Store Groq API key securely (Keychain / libsecret / Credential Manager)" + colorReset,
+		"",
+		"auth status",
+		colorDim + "Show authentication state and key source" + colorReset,
+		"",
+		fmt.Sprintf("config groq-model %s", defaultGroqModel),
+		colorDim + "Set the Groq model for AI generation" + colorReset,
 	})
 }
 
