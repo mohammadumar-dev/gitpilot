@@ -14,25 +14,39 @@ Git Pilot is a Go-based CLI that helps you review local Git changes, generate AI
 
 ## Installation
 
-### Prerequisites
+### Homebrew (macOS and Linux)
 
-- Go `1.26.2` or newer
-- Git
-- A Groq API key for AI commit generation
+```sh
+brew tap mohammadumar-dev/tap
+brew install gitpilot
+```
 
-### Build
+### go install (Go developers)
 
-```bash
+```sh
+go install github.com/mohammadumar-dev/gitpilot@latest
+```
+
+### One-line installer (Linux, macOS, Windows/WSL)
+
+Downloads the correct pre-built binary, verifies SHA256 checksum, and installs to `/usr/local/bin`:
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/mohammadumar-dev/gitpilot/main/install.sh | sh
+```
+
+### Build from source
+
+```sh
 git clone https://github.com/mohammadumar-dev/gitpilot.git
 cd gitpilot
-go build -o gitpilot .
+make build
 ```
 
-### Run without building
+### Prerequisites
 
-```bash
-go run .
-```
+- Git (required at runtime)
+- A [Groq API key](https://console.groq.com/) for AI commit generation
 
 ## Configuration
 
@@ -122,11 +136,17 @@ Push committed changes now? [y/N]: y
 
 ```text
 .
-├── main.go      # CLI, Git integration, AI prompts, and terminal UI
-├── go.mod       # Go module definition
-├── README.md    # Project documentation
-├── AGENTS.md    # Contributor guide
-└── .gitignore
+├── main.go                        # CLI, Git integration, AI prompts, and terminal UI
+├── go.mod                         # Go module definition
+├── Makefile                       # Developer workflow (build, fmt, clean, release-dry)
+├── .goreleaser.yml                # Cross-platform release configuration
+├── install.sh                     # Universal binary installer
+├── README.md
+├── AGENTS.md
+├── LICENSE
+└── .github/
+    └── workflows/
+        └── release.yml            # Publishes release on git tag push
 ```
 
 ## Development
