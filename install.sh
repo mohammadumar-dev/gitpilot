@@ -52,7 +52,9 @@ curl -sSfL "$CHECKSUMS_URL" -o "${TMP_DIR}/checksums.txt"
 
 printf 'Verifying checksum...\n'
 cd "$TMP_DIR"
-if command -v sha256sum > /dev/null 2>&1; then
+if [ "$OS" = "darwin" ]; then
+  grep "  ${ARCHIVE}$" checksums.txt | shasum -a 256 --check --status
+elif command -v sha256sum > /dev/null 2>&1; then
   grep "  ${ARCHIVE}$" checksums.txt | sha256sum --check --status
 elif command -v shasum > /dev/null 2>&1; then
   grep "  ${ARCHIVE}$" checksums.txt | shasum -a 256 --check --status
