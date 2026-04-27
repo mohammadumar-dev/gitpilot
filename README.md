@@ -4,12 +4,13 @@ Git Pilot is a Go-based CLI that helps you review local Git changes, generate AI
 
 ## Features
 
+- Secure API key storage via OS keychain (macOS Keychain, Linux libsecret, Windows Credential Manager)
 - Interactive commit workflow with approval before each commit
 - AI-generated commit messages with conventional prefixes such as `feat:`, `fix:`, and `refactor:`
 - File-wise commit mode
 - AI group-wise commit mode for related changes
 - Push and pull confirmation flows
-- Local repository configuration for Groq model and API key source detection
+- PR message generation from commit history
 - Modern terminal UI with structured previews and summaries
 
 ## Installation
@@ -48,31 +49,36 @@ make build
 - Git (required at runtime)
 - A [Groq API key](https://console.groq.com/) for AI commit generation
 
+## Authentication
+
+Store your Groq API key securely using the `auth` command. The key is stored in the OS keychain where available, falling back to `~/.config/gitpilot/credentials` (chmod 0600).
+
+```sh
+gitpilot auth login
+```
+
+You will be prompted to paste your key — input is hidden and the key is validated before storing.
+
+```sh
+gitpilot auth status    # show which source is active
+gitpilot auth logout    # remove stored key
+```
+
+The environment variable `GROQ_API_KEY` always takes priority over stored keys (useful for CI/CD).
+
 ## Configuration
 
-You can provide the Groq API key in either of these ways:
+Set or inspect the Groq model:
 
-```bash
-export GROQ_API_KEY="your-groq-api-key"
-```
-
-or:
-
-```bash
-go run . config groq-key your-groq-api-key
-```
-
-Set or inspect the model:
-
-```bash
-go run . config groq-model llama-3.3-70b-versatile
-go run . config show
+```sh
+gitpilot config groq-model llama-3.3-70b-versatile
+gitpilot config show
 ```
 
 Initialize repository-local Git Pilot settings:
 
-```bash
-go run . init
+```sh
+gitpilot init
 ```
 
 `init` validates the current Git repository and seeds local Git config values such as `gitpilot.groq-model` and `gitpilot.initialized`.
@@ -81,29 +87,29 @@ go run . init
 
 Start interactive mode:
 
-```bash
-go run .
+```sh
+gitpilot
 ```
 
-Common commands:
+Run a command directly:
 
-```bash
-go run . status
-go run . diff
-go run . commit
-go run . push
-go run . pull
-go run . help
+```sh
+gitpilot status
+gitpilot diff
+gitpilot commit
+gitpilot push
+gitpilot pull
+gitpilot pr
+gitpilot version
+gitpilot help
 ```
 
 `push` and `pull` both show a preview and ask for approval before running the underlying Git command. `pull` uses `git pull --ff-only` to avoid implicit merge commits.
 
 ### Commit workflow
 
-Run:
-
-```bash
-go run . commit
+```sh
+gitpilot commit
 ```
 
 Git Pilot will:
@@ -117,9 +123,16 @@ Git Pilot will:
 
 Direct modes are also supported:
 
-```bash
-go run . commit file main.go
-go run . commit group
+```sh
+gitpilot commit file main.go
+gitpilot commit group
+```
+
+### PR message generation
+
+```sh
+gitpilot pr           # uses origin/main as base
+gitpilot pr develop   # uses a custom base branch
 ```
 
 ## Example Flow
@@ -141,6 +154,7 @@ Push committed changes now? [y/N]: y
 ├── Makefile                       # Developer workflow (build, fmt, clean, release-dry)
 ├── .goreleaser.yml                # Cross-platform release configuration
 ├── install.sh                     # Universal binary installer
+├── install-test.sh                # Local end-to-end installer test (8 tests, no GitHub needed)
 ├── README.md
 ├── AGENTS.md
 ├── LICENSE
@@ -151,12 +165,25 @@ Push committed changes now? [y/N]: y
 
 ## Development
 
-Useful commands:
+```sh
+make build        # build with version from git describe
+make fmt          # run gofmt
+make clean        # remove binary
+make release-dry  # test GoReleaser locally without publishing
+```
 
-```bash
-gofmt -w main.go
-go build ./...
+Or using Go directly:
+
+```sh
+go build -ldflags="-X main.version=dev" -o gitpilot .
 go run . help
+gofmt -w main.go
+```
+
+Test the installer locally without a GitHub release:
+
+```sh
+sh install-test.sh
 ```
 
 ## Current Limitations
@@ -170,13 +197,14 @@ go run . help
 - Spinner/progress feedback for AI calls
 - Editable AI-generated commit messages before approval
 - Richer Git status breakdowns
+- Homebrew tap support
 - Better non-interactive scripting support
 
 ## Contributing
 
 Contributions are welcome. Before opening a pull request:
 
-- run `gofmt -w main.go`
+- run `make fmt`
 - run `go build ./...`
 - test the command flow you changed
 
