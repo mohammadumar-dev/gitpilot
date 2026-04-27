@@ -28,12 +28,20 @@ brew install gitpilot
 go install github.com/mohammadumar-dev/gitpilot@latest
 ```
 
-### One-line installer (Linux, macOS, Windows/WSL)
+### One-line installer (Linux and macOS)
 
 Downloads the correct pre-built binary, verifies SHA256 checksum, and installs to `/usr/local/bin`:
 
 ```sh
 curl -sSfL https://raw.githubusercontent.com/mohammadumar-dev/gitpilot/main/install.sh | sh
+```
+
+### Windows (PowerShell)
+
+Downloads, verifies SHA256 checksum, installs to `%LOCALAPPDATA%\Programs\gitpilot`, and adds it to your user PATH automatically:
+
+```powershell
+irm https://raw.githubusercontent.com/mohammadumar-dev/gitpilot/main/install.ps1 | iex
 ```
 
 ### Build from source
@@ -153,7 +161,8 @@ Push committed changes now? [y/N]: y
 ├── go.mod                         # Go module definition
 ├── Makefile                       # Developer workflow (build, fmt, clean, release-dry)
 ├── .goreleaser.yml                # Cross-platform release configuration
-├── install.sh                     # Universal binary installer
+├── install.sh                     # Linux/macOS installer
+├── install.ps1                    # Windows PowerShell installer
 ├── install-test.sh                # Local end-to-end installer test (8 tests, no GitHub needed)
 ├── README.md
 ├── AGENTS.md
