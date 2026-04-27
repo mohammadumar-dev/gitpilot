@@ -1,0 +1,51 @@
+name: Test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build
+        run: go build -ldflags="-X main.version=test" -o gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
+
+      - name: Version
+        run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} version
+
+      - name: Help
+        run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} help
+
+      - name: Auth status (no key set)
+        run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} auth status
+
+      - name: Auth status (env var)
+        run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} auth status
+        env:
+          GROQ_API_KEY: gsk_testkey1234567890
+
+      - name: Config show
+        run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} config show
+        env:
+          GROQ_API_KEY: gsk_testkey1234567890
