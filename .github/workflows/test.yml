@@ -10,8 +10,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ── Build & command tests on all 3 platforms ────────────────────────────────
   test:
-    name: Test on ${{ matrix.os }}
+    name: Build & Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
 
     strategy:
@@ -49,3 +50,52 @@ jobs:
         run: ./gitpilot${{ matrix.os == 'windows-latest' && '.exe' || '' }} config show
         env:
           GROQ_API_KEY: gsk_testkey1234567890
+
+  # ── install.sh test on Linux and macOS ─────────────────────────────────────
+  test-installer-unix:
+    name: install.sh on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run install.sh
+        run: sh install.sh
+
+      - name: Verify installed binary
+        run: gitpilot version
+
+      - name: Verify auth status works
+        run: gitpilot auth status
+
+  # ── install.ps1 test on Windows ─────────────────────────────────────────────
+  test-installer-windows:
+    name: install.ps1 on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run install.ps1
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          .\install.ps1
+
+      - name: Verify installed binary
+        shell: pwsh
+        run: |
+          $bin = "$env:LOCALAPPDATA\Programs\gitpilot\gitpilot.exe"
+          & $bin version
+
+      - name: Verify auth status works
+        shell: pwsh
+        run: |
+          $bin = "$env:LOCALAPPDATA\Programs\gitpilot\gitpilot.exe"
+          & $bin auth status
