@@ -28,9 +28,16 @@ else
 fi
 
 printf 'Fetching latest release tag...\n'
-VERSION=$(curl -sSfL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep '"tag_name"' \
-  | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  VERSION=$(curl -sSfL -H "Authorization: token $GITHUB_TOKEN" \
+    "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep '"tag_name"' \
+    | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+else
+  VERSION=$(curl -sSfL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep '"tag_name"' \
+    | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+fi
 
 if [ -z "$VERSION" ]; then
   printf 'Failed to resolve latest release version.\n' >&2; exit 1

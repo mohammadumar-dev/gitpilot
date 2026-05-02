@@ -66,6 +66,8 @@ jobs:
 
       - name: Run install.sh
         run: sh install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify installed binary
         run: gitpilot version
