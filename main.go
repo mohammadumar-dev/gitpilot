@@ -36,6 +36,13 @@ const (
 	colorWarn        = "\033[38;5;221m"
 	colorError       = "\033[38;5;203m"
 	colorStrong      = "\033[1m"
+
+	maxAIContextChars       = 16000
+	maxGroupingContextChars = 14000
+	maxDiffExcerptChars     = 3500
+	minDiffExcerptChars     = 600
+	diffHeadLines           = 24
+	diffTailLines           = 14
 )
 
 type FileChange struct {
@@ -47,6 +54,7 @@ type FileChange struct {
 type chatCompletionRequest struct {
 	Model       string        `json:"model"`
 	Temperature float64       `json:"temperature"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Messages    []chatMessage `json:"messages"`
 }
 
@@ -744,6 +752,7 @@ func generateCommitGroups(apiKey, model string, changes []FileChange) (string, e
 	payload := chatCompletionRequest{
 		Model:       model,
 		Temperature: 0.1,
+		MaxTokens:   900,
 		Messages: []chatMessage{
 			{
 				Role: "system",
@@ -758,64 +767,14 @@ func generateCommitGroups(apiKey, model string, changes []FileChange) (string, e
 		},
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, groqAPIURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var completion chatCompletionResponse
-	if err := json.Unmarshal(responseBody, &completion); err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode >= 400 {
-		if completion.Error != nil && completion.Error.Message != "" {
-			return "", errors.New(completion.Error.Message)
-		}
-		return "", fmt.Errorf("groq request failed with status %s", resp.Status)
-	}
-
-	if len(completion.Choices) == 0 {
-		return "", errors.New("groq returned no choices")
-	}
-
-	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+	return sendGroqChat(apiKey, payload)
 }
 
 func buildGroupingPrompt(changes []FileChange) string {
 	var builder strings.Builder
 	builder.WriteString("Group these changed files into logical commits.\n")
 	builder.WriteString("Prefer a small number of clear categories. Keep unrelated files separate.\n\n")
-
-	for _, change := range changes {
-		builder.WriteString("File: ")
-		builder.WriteString(change.FileName)
-		builder.WriteString("\nStatus: ")
-		builder.WriteString(change.Status)
-		builder.WriteString("\nDiff:\n")
-		builder.WriteString(change.Diff)
-		builder.WriteString("\n\n")
-	}
+	builder.WriteString(buildManagedChangeContext(changes, maxGroupingContextChars))
 
 	return builder.String()
 }
@@ -896,6 +855,7 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 	payload := chatCompletionRequest{
 		Model:       model,
 		Temperature: 0.2,
+		MaxTokens:   200,
 		Messages: []chatMessage{
 			{
 				Role:    "system",
@@ -908,6 +868,202 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 		},
 	}
 
+	return sendGroqChat(apiKey, payload)
+}
+
+func buildCommitPrompt(changes []FileChange) string {
+	var builder strings.Builder
+	builder.WriteString("Generate a git commit message for these changes.\n")
+	builder.WriteString("Summarize the main behavior change, not the implementation trivia.\n\n")
+	builder.WriteString(buildManagedChangeContext(changes, maxAIContextChars))
+
+	return builder.String()
+}
+
+type diffStats struct {
+	Added      int
+	Removed    int
+	HunkCount  int
+	Hunks      []string // first 8 stored for display
+	Binary     bool
+}
+
+func buildManagedChangeContext(changes []FileChange, budget int) string {
+	if budget < 1000 {
+		budget = 1000
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Changed files overview:\n")
+	for _, change := range changes {
+		stats := analyzeDiff(change.Diff)
+		builder.WriteString("- ")
+		builder.WriteString(change.Status)
+		builder.WriteString(" ")
+		builder.WriteString(change.FileName)
+		builder.WriteString(" (")
+		if stats.Binary {
+			builder.WriteString("binary")
+		} else {
+			builder.WriteString("+")
+			builder.WriteString(strconv.Itoa(stats.Added))
+			builder.WriteString(" -")
+			builder.WriteString(strconv.Itoa(stats.Removed))
+			builder.WriteString(", ")
+			builder.WriteString(strconv.Itoa(stats.HunkCount))
+			builder.WriteString(" hunk(s)")
+		}
+		builder.WriteString(")\n")
+	}
+	builder.WriteString("\nDiff context:\n")
+	builder.WriteString("Large diffs are summarized with representative excerpts to stay within the model request limit.\n\n")
+
+	if builder.Len() >= budget {
+		return truncateContext(builder.String(), budget)
+	}
+
+	for index, change := range changes {
+		remainingFiles := len(changes) - index
+		remainingBudget := budget - builder.Len()
+		if remainingBudget <= 0 {
+			break
+		}
+
+		fileBudget := remainingBudget / remainingFiles
+		if fileBudget > maxDiffExcerptChars {
+			fileBudget = maxDiffExcerptChars
+		}
+		if fileBudget < minDiffExcerptChars && remainingBudget >= minDiffExcerptChars {
+			fileBudget = minDiffExcerptChars
+		}
+
+		entry := buildFileChangeContext(change, fileBudget)
+		if builder.Len()+len(entry) > budget {
+			entry = buildFileChangeContext(change, remainingBudget)
+		}
+		if builder.Len()+len(entry) > budget {
+			break
+		}
+		builder.WriteString(entry)
+	}
+
+	return truncateContext(builder.String(), budget)
+}
+
+func buildFileChangeContext(change FileChange, budget int) string {
+	var header strings.Builder
+	header.WriteString("File: ")
+	header.WriteString(change.FileName)
+	header.WriteString("\nStatus: ")
+	header.WriteString(change.Status)
+	header.WriteString("\n")
+
+	if budget <= header.Len()+120 {
+		stats := analyzeDiff(change.Diff)
+		header.WriteString(formatDiffSummary(stats))
+		header.WriteString("\n")
+		return header.String()
+	}
+
+	diffBudget := budget - header.Len() - 2
+	header.WriteString(compactDiff(change.Diff, diffBudget))
+	header.WriteString("\n\n")
+	return header.String()
+}
+
+func compactDiff(diff string, budget int) string {
+	diff = strings.TrimSpace(diff)
+	if diff == "" {
+		return "Diff: unavailable\n"
+	}
+	if len(diff) <= budget {
+		return "Diff:\n" + diff + "\n"
+	}
+
+	stats := analyzeDiff(diff)
+	summary := formatDiffSummary(stats)
+	prefix := summary + "Representative diff excerpt (truncated):\n"
+	excerptBudget := budget - len(prefix) - len("\n[diff truncated]\n")
+	if excerptBudget <= 0 {
+		return truncateContext(summary, budget)
+	}
+
+	return prefix + excerptDiff(diff, excerptBudget) + "\n[diff truncated]\n"
+}
+
+func analyzeDiff(diff string) diffStats {
+	var stats diffStats
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "Binary files "):
+			stats.Binary = true
+		case strings.HasPrefix(line, "@@"):
+			stats.HunkCount++
+			if len(stats.Hunks) < 8 {
+				stats.Hunks = append(stats.Hunks, strings.TrimSpace(line))
+			}
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			stats.Added++
+		case strings.HasPrefix(line, "-"):
+			stats.Removed++
+		}
+	}
+	return stats
+}
+
+func formatDiffSummary(stats diffStats) string {
+	if stats.Binary {
+		return "Diff summary: binary file changed.\n"
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Diff summary: +")
+	builder.WriteString(strconv.Itoa(stats.Added))
+	builder.WriteString(" -")
+	builder.WriteString(strconv.Itoa(stats.Removed))
+	builder.WriteString(" across ")
+	builder.WriteString(strconv.Itoa(stats.HunkCount))
+	builder.WriteString(" hunk(s).\n")
+	if len(stats.Hunks) > 0 {
+		builder.WriteString("Hunks:\n")
+		for _, hunk := range stats.Hunks {
+			builder.WriteString("- ")
+			builder.WriteString(hunk)
+			builder.WriteString("\n")
+		}
+	}
+	return builder.String()
+}
+
+func excerptDiff(diff string, budget int) string {
+	lines := strings.Split(diff, "\n")
+	if len(lines) <= diffHeadLines+diffTailLines {
+		return truncateContext(diff, budget)
+	}
+
+	selected := make([]string, 0, diffHeadLines+diffTailLines+1)
+	selected = append(selected, lines[:diffHeadLines]...)
+	selected = append(selected, "[middle of diff omitted]")
+	selected = append(selected, lines[len(lines)-diffTailLines:]...)
+
+	excerpt := strings.Join(selected, "\n")
+	return truncateContext(excerpt, budget)
+}
+
+func truncateContext(text string, limit int) string {
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	const marker = "\n[context truncated]\n"
+	if limit <= len(marker) {
+		return text[:limit]
+	}
+	return text[:limit-len(marker)] + marker
+}
+
+func sendGroqChat(apiKey string, payload chatCompletionRequest) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -950,24 +1106,6 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 	}
 
 	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
-}
-
-func buildCommitPrompt(changes []FileChange) string {
-	var builder strings.Builder
-	builder.WriteString("Generate a git commit message for these changes.\n")
-	builder.WriteString("Summarize the main behavior change, not the implementation trivia.\n\n")
-
-	for _, change := range changes {
-		builder.WriteString("File: ")
-		builder.WriteString(change.FileName)
-		builder.WriteString("\nStatus: ")
-		builder.WriteString(change.Status)
-		builder.WriteString("\nDiff:\n")
-		builder.WriteString(change.Diff)
-		builder.WriteString("\n\n")
-	}
-
-	return builder.String()
 }
 
 func getConfigDir() string {
@@ -1036,12 +1174,13 @@ func keychainWrite(key string) error {
 		cmd.Stdin = strings.NewReader(key)
 		return cmd.Run()
 	case "windows":
-		script := fmt.Sprintf(
-			`[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]|Out-Null;`+
-				`$v=New-Object Windows.Security.Credentials.PasswordVault;`+
-				`$c=New-Object Windows.Security.Credentials.PasswordCredential('gitpilot','groq-api-key','%s');`+
-				`$v.Add($c)`, key)
-		return exec.Command("powershell", "-NonInteractive", "-Command", script).Run()
+		script := `[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime]|Out-Null;` +
+			`$v=New-Object Windows.Security.Credentials.PasswordVault;` +
+			`$c=New-Object Windows.Security.Credentials.PasswordCredential('gitpilot','groq-api-key',$env:GITPILOT_KEY);` +
+			`$v.Add($c)`
+		cmd := exec.Command("powershell", "-NonInteractive", "-Command", script)
+		cmd.Env = append(os.Environ(), "GITPILOT_KEY="+key)
+		return cmd.Run()
 	default:
 		return errors.New("keychain not supported")
 	}
@@ -1481,6 +1620,7 @@ func generatePRMessage(apiKey, model, base string, commits []CommitInfo) (string
 	payload := chatCompletionRequest{
 		Model:       model,
 		Temperature: 0.2,
+		MaxTokens:   1000,
 		Messages: []chatMessage{
 			{
 				Role: "system",
@@ -1495,48 +1635,7 @@ func generatePRMessage(apiKey, model, base string, commits []CommitInfo) (string
 		},
 	}
 
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, groqAPIURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	responseBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	var completion chatCompletionResponse
-	if err := json.Unmarshal(responseBody, &completion); err != nil {
-		return "", err
-	}
-
-	if resp.StatusCode >= 400 {
-		if completion.Error != nil && completion.Error.Message != "" {
-			return "", errors.New(completion.Error.Message)
-		}
-		return "", fmt.Errorf("groq request failed with status %s", resp.Status)
-	}
-
-	if len(completion.Choices) == 0 {
-		return "", errors.New("groq returned no choices")
-	}
-
-	return strings.TrimSpace(completion.Choices[0].Message.Content), nil
+	return sendGroqChat(apiKey, payload)
 }
 
 func buildPRPrompt(base string, commits []CommitInfo) string {
