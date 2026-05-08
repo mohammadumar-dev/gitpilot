@@ -43,6 +43,8 @@ const (
 	minDiffExcerptChars     = 600
 	diffHeadLines           = 24
 	diffTailLines           = 14
+	maxSemanticItems        = 12
+	maxSampleLines          = 8
 )
 
 type FileChange struct {
@@ -852,32 +854,240 @@ func formatFilesForDisplay(changes []FileChange) string {
 }
 
 func generateCommitMessage(apiKey, model string, changes []FileChange) (string, error) {
+	prompt := buildCommitPrompt(changes)
 	payload := chatCompletionRequest{
 		Model:       model,
-		Temperature: 0.2,
+		Temperature: 0.15,
 		MaxTokens:   200,
 		Messages: []chatMessage{
 			{
-				Role:    "system",
-				Content: "You write concise git commit messages. Reply with exactly one imperative commit subject line using a conventional prefix such as feat:, fix:, refactor:, docs:, test:, chore:, style:, perf:, build:, or ci:. Choose the most accurate tag from the diff. No quotes, no bullet points, max 72 characters.",
+				Role: "system",
+				Content: "You write high-signal git commit subjects. Reply with exactly one imperative conventional commit subject. " +
+					"Allowed prefixes: feat:, fix:, docs:, style:, refactor:, perf:, test:, build:, ci:, chore:, revert:. " +
+					"Choose the prefix from the actual changed area and intent. Use a concrete object and action from the provided summaries. " +
+					"Never use vague words like update, changes, stuff, misc, null, handle, or file unless they are part of a real API name. " +
+					"No quotes, no markdown, no bullet points, max 72 characters.",
 			},
 			{
 				Role:    "user",
-				Content: buildCommitPrompt(changes),
+				Content: prompt,
 			},
 		},
 	}
 
-	return sendGroqChat(apiKey, payload)
+	message, err := sendGroqChat(apiKey, payload)
+	if err != nil {
+		return "", err
+	}
+	message = sanitizeCommitMessage(message)
+	if isUsableCommitMessage(message) {
+		return message, nil
+	}
+
+	payload.Messages = append(payload.Messages,
+		chatMessage{Role: "assistant", Content: message},
+		chatMessage{Role: "user", Content: "That subject is too vague or malformed. Generate one specific conventional commit subject using the file summaries and changed symbols. Do not include null, generic filler, or explanations."},
+	)
+	message, err = sendGroqChat(apiKey, payload)
+	if err != nil {
+		return "", err
+	}
+	message = sanitizeCommitMessage(message)
+	if isUsableCommitMessage(message) {
+		return message, nil
+	}
+
+	return fallbackCommitMessage(changes), nil
 }
 
 func buildCommitPrompt(changes []FileChange) string {
 	var builder strings.Builder
 	builder.WriteString("Generate a git commit message for these changes.\n")
 	builder.WriteString("Summarize the main behavior change, not the implementation trivia.\n\n")
+	builder.WriteString("Prefix selection guidance:\n")
+	builder.WriteString("- feat: new user-facing behavior or capability\n")
+	builder.WriteString("- fix: bug fix or error handling correction\n")
+	builder.WriteString("- docs: documentation-only changes\n")
+	builder.WriteString("- refactor: internal restructuring without behavior change\n")
+	builder.WriteString("- test: tests only\n")
+	builder.WriteString("- build: build, packaging, release, dependency, or installer changes\n")
+	builder.WriteString("- ci: workflow or automation changes\n")
+	builder.WriteString("- chore: maintenance that does not fit the above\n\n")
 	builder.WriteString(buildManagedChangeContext(changes, maxAIContextChars))
 
 	return builder.String()
+}
+
+func sanitizeCommitMessage(message string) string {
+	message = strings.TrimSpace(message)
+	message = strings.TrimPrefix(message, "```")
+	message = strings.TrimSuffix(message, "```")
+	message = strings.TrimSpace(message)
+	lines := strings.Split(message, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "- ")
+		line = strings.TrimPrefix(line, "* ")
+		line = strings.Trim(line, `"'`)
+		if line != "" {
+			message = line
+			break
+		}
+	}
+	if len(message) > 72 {
+		message = strings.TrimSpace(message[:72])
+	}
+	return message
+}
+
+func isUsableCommitMessage(message string) bool {
+	if message == "" || !hasConventionalPrefix(message) {
+		return false
+	}
+
+	lower := strings.ToLower(message)
+	badFragments := []string{
+		": null",
+		" null ",
+		"undefined",
+		"todo",
+		"misc",
+		"stuff",
+		"changes",
+		"update files",
+		"handle changes",
+		"handle updates",
+	}
+	for _, fragment := range badFragments {
+		if strings.Contains(lower, fragment) {
+			return false
+		}
+	}
+
+	parts := strings.SplitN(message, ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	subject := strings.TrimSpace(parts[1])
+	if len(subject) < 8 {
+		return false
+	}
+	return len(strings.Fields(subject)) >= 2
+}
+
+func hasConventionalPrefix(message string) bool {
+	lower := strings.ToLower(message)
+	for _, prefix := range conventionalPrefixes() {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func conventionalPrefixes() []string {
+	return []string{"feat:", "fix:", "docs:", "style:", "refactor:", "perf:", "test:", "build:", "ci:", "chore:", "revert:"}
+}
+
+func fallbackCommitMessage(changes []FileChange) string {
+	prefix := fallbackPrefix(changes)
+	object := fallbackObject(changes)
+	action := fallbackAction(changes)
+	message := prefix + " " + action + " " + object
+	if len(message) > 72 {
+		message = strings.TrimSpace(message[:72])
+	}
+	return message
+}
+
+func fallbackPrefix(changes []FileChange) string {
+	if len(changes) == 0 {
+		return "chore:"
+	}
+
+	areas := make(map[string]int)
+	for _, change := range changes {
+		areas[classifyFileArea(change.FileName)]++
+	}
+	if len(areas) == 1 {
+		for area := range areas {
+			switch area {
+			case "documentation":
+				return "docs:"
+			case "tests":
+				return "test:"
+			case "ci":
+				return "ci:"
+			case "build/tooling", "dependencies":
+				return "build:"
+			case "configuration":
+				return "chore:"
+			}
+		}
+	}
+
+	for _, change := range changes {
+		stats := analyzeDiff(change.Diff)
+		if stats.NewFile || strings.Contains(change.Status, "?") || strings.Contains(change.Status, "A") {
+			return "feat:"
+		}
+	}
+
+	return "refactor:"
+}
+
+func fallbackAction(changes []FileChange) string {
+	if len(changes) == 1 {
+		stats := analyzeDiff(changes[0].Diff)
+		switch {
+		case stats.NewFile || strings.Contains(changes[0].Status, "?") || strings.Contains(changes[0].Status, "A"):
+			return "add"
+		case stats.Deleted || strings.Contains(changes[0].Status, "D"):
+			return "remove"
+		case stats.Renamed || strings.Contains(changes[0].Status, "R"):
+			return "rename"
+		}
+	}
+	return "revise"
+}
+
+func fallbackObject(changes []FileChange) string {
+	if len(changes) == 0 {
+		return "project changes"
+	}
+	if len(changes) == 1 {
+		return humanizePath(changes[0].FileName)
+	}
+
+	areaCounts := make(map[string]int)
+	for _, change := range changes {
+		areaCounts[classifyFileArea(change.FileName)]++
+	}
+	bestArea := "project changes"
+	bestCount := 0
+	for area, count := range areaCounts {
+		if count > bestCount {
+			bestArea = area
+			bestCount = count
+		}
+	}
+	return bestArea
+}
+
+func humanizePath(path string) string {
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	name = strings.ReplaceAll(name, "_", " ")
+	name = strings.ReplaceAll(name, "-", " ")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = strings.TrimSpace(base)
+	}
+	if name == "" {
+		return "project file"
+	}
+	return name
 }
 
 type diffStats struct {
@@ -886,6 +1096,11 @@ type diffStats struct {
 	HunkCount  int
 	Hunks      []string // first 8 stored for display
 	Binary     bool
+	NewFile    bool
+	Deleted    bool
+	Renamed    bool
+	RenameFrom string
+	RenameTo   string
 }
 
 func buildManagedChangeContext(changes []FileChange, budget int) string {
@@ -897,11 +1112,14 @@ func buildManagedChangeContext(changes []FileChange, budget int) string {
 	builder.WriteString("Changed files overview:\n")
 	for _, change := range changes {
 		stats := analyzeDiff(change.Diff)
+		descriptor := describeChange(change, stats)
 		builder.WriteString("- ")
 		builder.WriteString(change.Status)
 		builder.WriteString(" ")
 		builder.WriteString(change.FileName)
 		builder.WriteString(" (")
+		builder.WriteString(descriptor)
+		builder.WriteString(", ")
 		if stats.Binary {
 			builder.WriteString("binary")
 		} else {
@@ -952,14 +1170,20 @@ func buildManagedChangeContext(changes []FileChange, budget int) string {
 
 func buildFileChangeContext(change FileChange, budget int) string {
 	var header strings.Builder
+	stats := analyzeDiff(change.Diff)
 	header.WriteString("File: ")
 	header.WriteString(change.FileName)
 	header.WriteString("\nStatus: ")
 	header.WriteString(change.Status)
 	header.WriteString("\n")
+	header.WriteString("Area: ")
+	header.WriteString(classifyFileArea(change.FileName))
+	header.WriteString("\nChange type: ")
+	header.WriteString(describeChange(change, stats))
+	header.WriteString("\n")
+	header.WriteString(buildSemanticSummary(change, stats))
 
 	if budget <= header.Len()+120 {
-		stats := analyzeDiff(change.Diff)
 		header.WriteString(formatDiffSummary(stats))
 		header.WriteString("\n")
 		return header.String()
@@ -997,6 +1221,16 @@ func analyzeDiff(diff string) diffStats {
 		switch {
 		case strings.HasPrefix(line, "Binary files "):
 			stats.Binary = true
+		case strings.HasPrefix(line, "new file mode "):
+			stats.NewFile = true
+		case strings.HasPrefix(line, "deleted file mode "):
+			stats.Deleted = true
+		case strings.HasPrefix(line, "rename from "):
+			stats.Renamed = true
+			stats.RenameFrom = strings.TrimSpace(strings.TrimPrefix(line, "rename from "))
+		case strings.HasPrefix(line, "rename to "):
+			stats.Renamed = true
+			stats.RenameTo = strings.TrimSpace(strings.TrimPrefix(line, "rename to "))
 		case strings.HasPrefix(line, "@@"):
 			stats.HunkCount++
 			if len(stats.Hunks) < 8 {
@@ -1011,6 +1245,216 @@ func analyzeDiff(diff string) diffStats {
 		}
 	}
 	return stats
+}
+
+func describeChange(change FileChange, stats diffStats) string {
+	switch {
+	case stats.NewFile || strings.Contains(change.Status, "?") || strings.Contains(change.Status, "A"):
+		return "new file"
+	case stats.Deleted || strings.Contains(change.Status, "D"):
+		return "deleted file"
+	case stats.Renamed || strings.Contains(change.Status, "R"):
+		if stats.RenameFrom != "" && stats.RenameTo != "" {
+			return "renamed from " + stats.RenameFrom + " to " + stats.RenameTo
+		}
+		return "renamed file"
+	case strings.Contains(change.Status, "M"):
+		return "modified file"
+	default:
+		return "changed file"
+	}
+}
+
+func classifyFileArea(path string) string {
+	lower := strings.ToLower(path)
+	base := strings.ToLower(filepath.Base(path))
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch {
+	case strings.HasPrefix(lower, ".github/") || strings.Contains(lower, "/workflows/"):
+		return "ci"
+	case base == "readme.md" || ext == ".md" || strings.HasPrefix(lower, "docs/"):
+		return "documentation"
+	case base == "go.mod" || base == "go.sum" || base == "package.json" || base == "package-lock.json" || base == "pnpm-lock.yaml" || base == "yarn.lock":
+		return "dependencies"
+	case base == "makefile" || base == "dockerfile" || strings.Contains(lower, "goreleaser") || strings.Contains(lower, "install"):
+		return "build/tooling"
+	case strings.HasSuffix(lower, "_test.go") || strings.Contains(lower, "/test/") || strings.Contains(lower, "/tests/") || strings.Contains(lower, ".test.") || strings.Contains(lower, ".spec."):
+		return "tests"
+	case ext == ".go" || ext == ".js" || ext == ".jsx" || ext == ".ts" || ext == ".tsx" || ext == ".py" || ext == ".rs" || ext == ".java" || ext == ".rb" || ext == ".php":
+		return "source"
+	case ext == ".json" || ext == ".yaml" || ext == ".yml" || ext == ".toml" || ext == ".ini" || ext == ".env":
+		return "configuration"
+	default:
+		return "project files"
+	}
+}
+
+func buildSemanticSummary(change FileChange, stats diffStats) string {
+	if stats.Binary {
+		return "Semantic summary: binary content changed; infer intent from file path and status.\n"
+	}
+
+	added, removed := collectChangedContent(change.Diff)
+	symbols := extractSemanticItems(change.FileName, added)
+	removedItems := extractSemanticItems(change.FileName, removed)
+
+	var builder strings.Builder
+	builder.WriteString("Semantic summary:\n")
+	if len(symbols) > 0 {
+		builder.WriteString("- Added or changed notable items: ")
+		builder.WriteString(strings.Join(symbols, "; "))
+		builder.WriteString("\n")
+	}
+	if len(removedItems) > 0 && !stats.NewFile {
+		builder.WriteString("- Removed notable items: ")
+		builder.WriteString(strings.Join(removedItems, "; "))
+		builder.WriteString("\n")
+	}
+	if len(symbols) == 0 && len(removedItems) == 0 {
+		samples := representativeLines(added, maxSampleLines)
+		if len(samples) == 0 {
+			samples = representativeLines(removed, maxSampleLines)
+		}
+		if len(samples) > 0 {
+			builder.WriteString("- Representative content: ")
+			builder.WriteString(strings.Join(samples, " | "))
+			builder.WriteString("\n")
+		} else {
+			builder.WriteString("- No readable changed content detected beyond diff metadata.\n")
+		}
+	}
+
+	return builder.String()
+}
+
+func collectChangedContent(diff string) ([]string, []string) {
+	var added []string
+	var removed []string
+	for _, line := range strings.Split(diff, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			continue
+		case strings.HasPrefix(line, "+"):
+			if text := cleanSemanticLine(strings.TrimPrefix(line, "+")); text != "" {
+				added = append(added, text)
+			}
+		case strings.HasPrefix(line, "-"):
+			if text := cleanSemanticLine(strings.TrimPrefix(line, "-")); text != "" {
+				removed = append(removed, text)
+			}
+		}
+	}
+	return added, removed
+}
+
+func extractSemanticItems(path string, lines []string) []string {
+	seen := make(map[string]struct{})
+	var items []string
+	for _, line := range lines {
+		item := semanticItemForLine(path, line)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		items = append(items, item)
+		if len(items) >= maxSemanticItems {
+			break
+		}
+	}
+	return items
+}
+
+func semanticItemForLine(path, line string) string {
+	trimmed := cleanSemanticLine(line)
+	if trimmed == "" {
+		return ""
+	}
+
+	lowerPath := strings.ToLower(path)
+	lower := strings.ToLower(trimmed)
+	switch {
+	case strings.HasSuffix(lowerPath, ".md") && strings.HasPrefix(trimmed, "#"):
+		return truncateSemanticItem("heading " + strings.TrimSpace(strings.TrimLeft(trimmed, "#")))
+	case strings.HasPrefix(trimmed, "func "):
+		return truncateSemanticItem(trimmed)
+	case strings.HasPrefix(trimmed, "type ") || strings.HasPrefix(trimmed, "const ") || strings.HasPrefix(trimmed, "var "):
+		return truncateSemanticItem(trimmed)
+	case strings.HasPrefix(trimmed, "package "):
+		return truncateSemanticItem(trimmed)
+	case strings.HasPrefix(trimmed, "class ") || strings.HasPrefix(trimmed, "interface "):
+		return truncateSemanticItem(trimmed)
+	case strings.HasPrefix(trimmed, "export ") || strings.HasPrefix(trimmed, "function "):
+		return truncateSemanticItem(trimmed)
+	case strings.Contains(lower, "func ") || strings.Contains(lower, "function ") || strings.Contains(lower, " class "):
+		return truncateSemanticItem(trimmed)
+	case strings.HasSuffix(lowerPath, ".json") || strings.HasSuffix(lowerPath, ".yml") || strings.HasSuffix(lowerPath, ".yaml") || strings.HasSuffix(lowerPath, ".toml"):
+		if key := configKeyFromLine(trimmed); key != "" {
+			return truncateSemanticItem("config " + key)
+		}
+	}
+
+	return ""
+}
+
+func representativeLines(lines []string, limit int) []string {
+	var samples []string
+	for _, line := range lines {
+		if isLowSignalLine(line) {
+			continue
+		}
+		samples = append(samples, truncateSemanticItem(line))
+		if len(samples) >= limit {
+			break
+		}
+	}
+	return samples
+}
+
+func cleanSemanticLine(line string) string {
+	line = strings.TrimSpace(line)
+	if line == "" || line == "{" || line == "}" || line == "[" || line == "]" || line == "," {
+		return ""
+	}
+	return strings.Join(strings.Fields(line), " ")
+}
+
+func isLowSignalLine(line string) bool {
+	trimmed := cleanSemanticLine(line)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	return lower == "package main" ||
+		strings.HasPrefix(lower, "import ") ||
+		strings.HasPrefix(lower, "//") ||
+		strings.HasPrefix(lower, "/*") ||
+		strings.HasPrefix(lower, "*") ||
+		len(trimmed) < 4
+}
+
+func configKeyFromLine(line string) string {
+	for _, sep := range []string{":", "="} {
+		if index := strings.Index(line, sep); index > 0 {
+			key := strings.Trim(strings.TrimSpace(line[:index]), `"'`)
+			if key != "" && !strings.Contains(key, " ") {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
+func truncateSemanticItem(item string) string {
+	const limit = 110
+	item = strings.TrimSpace(item)
+	if len(item) <= limit {
+		return item
+	}
+	return item[:limit-3] + "..."
 }
 
 func formatDiffSummary(stats diffStats) string {
