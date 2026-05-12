@@ -37,14 +37,17 @@ const (
 	colorError       = "\033[38;5;203m"
 	colorStrong      = "\033[1m"
 
-	maxAIContextChars       = 16000
-	maxGroupingContextChars = 14000
-	maxDiffExcerptChars     = 3500
-	minDiffExcerptChars     = 600
-	diffHeadLines           = 24
-	diffTailLines           = 14
-	maxSemanticItems        = 12
-	maxSampleLines          = 8
+	maxAIContextChars        = 16000
+	maxCommitRequestTokens   = 1400
+	maxGroupingRequestTokens = 1200
+	maxDiffExcerptChars      = 3500
+	minDiffExcerptChars      = 600
+	diffHeadLines            = 24
+	diffTailLines            = 14
+	maxSemanticItems         = 12
+	maxSampleLines           = 8
+	estimatedCharsPerToken   = 4
+	maxGroqAttempts          = 4
 )
 
 type FileChange struct {
@@ -754,11 +757,11 @@ func generateCommitGroups(apiKey, model string, changes []FileChange) (string, e
 	payload := chatCompletionRequest{
 		Model:       model,
 		Temperature: 0.1,
-		MaxTokens:   900,
+		MaxTokens:   500,
 		Messages: []chatMessage{
 			{
 				Role: "system",
-				Content: "You group changed files into logical git commits. Return JSON only. " +
+				Content: "You group changed file paths into logical git commits. Use only path, status, and area metadata; do not assume diff contents. Return JSON only. " +
 					`Use this schema: [{"label":"short category label","files":["path1","path2"]}]. ` +
 					"Each file must appear at most once.",
 			},
@@ -769,15 +772,57 @@ func generateCommitGroups(apiKey, model string, changes []FileChange) (string, e
 		},
 	}
 
+	payload = limitChatPayload(payload, maxGroupingRequestTokens)
 	return sendGroqChat(apiKey, payload)
 }
 
 func buildGroupingPrompt(changes []FileChange) string {
 	var builder strings.Builder
-	builder.WriteString("Group these changed files into logical commits.\n")
-	builder.WriteString("Prefer a small number of clear categories. Keep unrelated files separate.\n\n")
-	builder.WriteString(buildManagedChangeContext(changes, maxGroupingContextChars))
+	builder.WriteString("Group these changed files into logical commits from the file graph only.\n")
+	builder.WriteString("Use directory structure, path names, extensions, status, and inferred area. Keep unrelated paths separate.\n\n")
+	builder.WriteString(buildChangedFilesGraph(changes))
 
+	return builder.String()
+}
+
+func buildChangedFilesGraph(changes []FileChange) string {
+	var builder strings.Builder
+	builder.WriteString("Changed file graph:\n")
+	for _, change := range changes {
+		builder.WriteString(formatGraphPath(change.FileName))
+		builder.WriteString(" [")
+		builder.WriteString(change.Status)
+		builder.WriteString(", ")
+		builder.WriteString(classifyFileArea(change.FileName))
+		builder.WriteString("]")
+		builder.WriteString("\n")
+	}
+	return builder.String()
+}
+
+func formatGraphPath(path string) string {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	if len(parts) == 0 {
+		return "- " + path
+	}
+
+	var builder strings.Builder
+	for index, part := range parts {
+		if part == "" {
+			continue
+		}
+		if builder.Len() == 0 {
+			builder.WriteString("- ")
+		} else {
+			builder.WriteString(" > ")
+		}
+		builder.WriteString(part)
+		if index == len(parts)-1 {
+			builder.WriteString(" (")
+			builder.WriteString(path)
+			builder.WriteString(")")
+		}
+	}
 	return builder.String()
 }
 
@@ -875,6 +920,7 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 		},
 	}
 
+	payload = limitChatPayload(payload, maxCommitRequestTokens)
 	message, err := sendGroqChat(apiKey, payload)
 	if err != nil {
 		return "", err
@@ -888,6 +934,7 @@ func generateCommitMessage(apiKey, model string, changes []FileChange) (string, 
 		chatMessage{Role: "assistant", Content: message},
 		chatMessage{Role: "user", Content: "That subject is too vague or malformed. Generate one specific conventional commit subject using the file summaries and changed symbols. Do not include null, generic filler, or explanations."},
 	)
+	payload = limitChatPayload(payload, maxCommitRequestTokens)
 	message, err = sendGroqChat(apiKey, payload)
 	if err != nil {
 		return "", err
@@ -1507,7 +1554,141 @@ func truncateContext(text string, limit int) string {
 	return text[:limit-len(marker)] + marker
 }
 
+func limitChatPayload(payload chatCompletionRequest, requestTokenBudget int) chatCompletionRequest {
+	if requestTokenBudget <= 0 {
+		return payload
+	}
+
+	availableInputTokens := requestTokenBudget - payload.MaxTokens - 80
+	if availableInputTokens < 300 {
+		availableInputTokens = 300
+	}
+
+	for estimateChatInputTokens(payload.Messages) > availableInputTokens {
+		userIndex := largestUserMessageIndex(payload.Messages)
+		if userIndex < 0 {
+			break
+		}
+
+		current := payload.Messages[userIndex].Content
+		overTokens := estimateChatInputTokens(payload.Messages) - availableInputTokens
+		cutChars := overTokens * estimatedCharsPerToken
+		target := len(current) - cutChars
+		if target < 500 {
+			target = 500
+		}
+		if target >= len(current) {
+			target = len(current) - estimatedCharsPerToken
+		}
+		if target <= 0 {
+			break
+		}
+
+		payload.Messages[userIndex].Content = truncateContext(current, target)
+	}
+
+	return payload
+}
+
+func largestUserMessageIndex(messages []chatMessage) int {
+	largestIndex := -1
+	largestSize := 0
+	for index, message := range messages {
+		if message.Role == "user" && len(message.Content) > largestSize {
+			largestIndex = index
+			largestSize = len(message.Content)
+		}
+	}
+	return largestIndex
+}
+
+func estimateChatInputTokens(messages []chatMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += estimateTokens(message.Role)
+		total += estimateTokens(message.Content)
+		total += 4
+	}
+	return total + 8
+}
+
+func estimateTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+
+	tokens := len(text) / estimatedCharsPerToken
+	if len(text)%estimatedCharsPerToken != 0 {
+		tokens++
+	}
+	return tokens
+}
+
 func sendGroqChat(apiKey string, payload chatCompletionRequest) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= maxGroqAttempts; attempt++ {
+		content, err := sendGroqChatOnce(apiKey, payload)
+		if err == nil {
+			return content, nil
+		}
+
+		lastErr = err
+		wait, ok := groqRetryDelay(err)
+		if !ok || attempt == maxGroqAttempts {
+			return "", err
+		}
+
+		if wait < 500*time.Millisecond {
+			wait = 500 * time.Millisecond
+		}
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
+		time.Sleep(wait)
+	}
+
+	return "", lastErr
+}
+
+type groqHTTPError struct {
+	statusCode int
+	status     string
+	message    string
+}
+
+func (err groqHTTPError) Error() string {
+	if err.message != "" {
+		return err.message
+	}
+	return "groq request failed with status " + err.status
+}
+
+func groqRetryDelay(err error) (time.Duration, bool) {
+	var httpErr groqHTTPError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+	if httpErr.statusCode != http.StatusTooManyRequests && !strings.Contains(strings.ToLower(httpErr.message), "rate limit") {
+		return 0, false
+	}
+
+	lower := strings.ToLower(httpErr.message)
+	marker := "try again in "
+	if index := strings.Index(lower, marker); index >= 0 {
+		remainder := httpErr.message[index+len(marker):]
+		fields := strings.Fields(remainder)
+		if len(fields) > 0 {
+			rawDuration := strings.TrimRight(fields[0], ".,;")
+			if delay, parseErr := time.ParseDuration(rawDuration); parseErr == nil {
+				return delay + 250*time.Millisecond, true
+			}
+		}
+	}
+
+	return 5 * time.Second, true
+}
+
+func sendGroqChatOnce(apiKey string, payload chatCompletionRequest) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -1540,9 +1721,9 @@ func sendGroqChat(apiKey string, payload chatCompletionRequest) (string, error) 
 
 	if resp.StatusCode >= 400 {
 		if completion.Error != nil && completion.Error.Message != "" {
-			return "", errors.New(completion.Error.Message)
+			return "", groqHTTPError{statusCode: resp.StatusCode, status: resp.Status, message: completion.Error.Message}
 		}
-		return "", fmt.Errorf("groq request failed with status %s", resp.Status)
+		return "", groqHTTPError{statusCode: resp.StatusCode, status: resp.Status}
 	}
 
 	if len(completion.Choices) == 0 {
